@@ -73,9 +73,10 @@ const (
 	stopMoveTaskGroupNamespace     = "/stop_move_task_group/"
 	moveTaskByGroupNamespace       = "/group_move_tasks/"
 
-	CoordKeepAliveTtl = 3
-	coordLockKey      = "coordinator_exists"
-	sequenceSpace     = "sequence_space"
+	CoordKeepAliveTtl  = 3
+	coordLockKey       = "coordinator_exists"
+	sequenceSpace      = "sequence_space"
+	transactionRequest = "transaction_request"
 
 	MaxLockRetry = 7
 )
@@ -1018,7 +1019,7 @@ func (q *EtcdQDB) GetShard(ctx context.Context, id string) (*Shard, error) {
 	}
 
 	if len(resp.Kvs) == 0 {
-		return nil, spqrerror.Newf(spqrerror.SPQR_NO_DATASHARD, "shard \"%s\" not found", id)
+		return nil, spqrerror.Newf(spqrerror.SPQR_NO_DATASHARD, "unknown shard %s", id)
 	}
 	if len(resp.Kvs) > 1 {
 		return nil, spqrerror.Newf(spqrerror.SPQR_METADATA_CORRUPTION,
@@ -1116,7 +1117,7 @@ func (q *EtcdQDB) AlterReferenceRelationStorage(ctx context.Context, relName *rf
 
 	switch len(resp.Kvs) {
 	case 0:
-		return spqrerror.New(spqrerror.SPQR_SHARDING_RULE_ERROR, "no such reference relation present in qdb")
+		return spqrerror.Newf(spqrerror.SPQR_OBJECT_NOT_EXIST, "reference relation \"%s\" not found", relName.String())
 	case 1:
 
 		var rrs *ReferenceRelation
@@ -1138,7 +1139,7 @@ func (q *EtcdQDB) AlterReferenceRelationStorage(ctx context.Context, relName *rf
 
 		return err
 	default:
-		return spqrerror.Newf(spqrerror.SPQR_SHARDING_RULE_ERROR, "too much reference relations matched: %d", len(resp.Kvs))
+		return spqrerror.Newf(spqrerror.SPQR_INVALID_REQUEST, "too much reference relations matched: %d", len(resp.Kvs))
 	}
 }
 
@@ -1158,7 +1159,7 @@ func (q *EtcdQDB) DropReferenceRelation(ctx context.Context, relName *rfqn.Relat
 
 	switch len(resp.Kvs) {
 	case 0:
-		return spqrerror.New(spqrerror.SPQR_SHARDING_RULE_ERROR, "no such reference relation present in qdb")
+		return spqrerror.Newf(spqrerror.SPQR_OBJECT_NOT_EXIST, "reference relation \"%s\" not found", relName.String())
 	case 1:
 
 		var rrs *ReferenceRelation
@@ -1179,7 +1180,7 @@ func (q *EtcdQDB) DropReferenceRelation(ctx context.Context, relName *rfqn.Relat
 		_, err = q.cli.Delete(ctx, relationMappingNodePath(tableName))
 		return err
 	default:
-		return spqrerror.Newf(spqrerror.SPQR_SHARDING_RULE_ERROR, "too much reference relations matched: %d", len(resp.Kvs))
+		return spqrerror.Newf(spqrerror.SPQR_INVALID_REQUEST, "too much reference relations matched: %d", len(resp.Kvs))
 	}
 }
 
@@ -1310,7 +1311,7 @@ func (q *EtcdQDB) DropDistribution(ctx context.Context, id string) error {
 
 	switch len(resp.Kvs) {
 	case 0:
-		return spqrerror.New(spqrerror.SPQR_SHARDING_RULE_ERROR, "no such distribution present in qdb")
+		return spqrerror.New(spqrerror.SPQR_OBJECT_NOT_EXIST, "no such distribution present in qdb")
 	case 1:
 
 		var distrib *Distribution
@@ -1337,7 +1338,7 @@ func (q *EtcdQDB) DropDistribution(ctx context.Context, id string) error {
 
 		return nil
 	default:
-		return spqrerror.Newf(spqrerror.SPQR_SHARDING_RULE_ERROR, "too much distributions matched: %d", len(resp.Kvs))
+		return spqrerror.Newf(spqrerror.SPQR_INVALID_REQUEST, "too much distributions matched: %d", len(resp.Kvs))
 	}
 }
 
@@ -2188,7 +2189,7 @@ func (q *EtcdQDB) GetRelationSequence(ctx context.Context, relName *rfqn.Relatio
 	return ret, nil
 }
 
-func (q *EtcdQDB) getSequenceColumns(ctx context.Context, seqName string) ([]string, error) {
+func (q *EtcdQDB) GetSequenceRelations(ctx context.Context, seqName string) ([]*rfqn.RelationFQN, error) {
 	spqrlog.Zero.Debug().
 		Str("seqName", seqName).
 		Msg("etcdqdb: get columns attached to a sequence")
@@ -2197,19 +2198,18 @@ func (q *EtcdQDB) getSequenceColumns(ctx context.Context, seqName string) ([]str
 		return nil, err
 	}
 
-	cols := []string{}
+	rels := []*rfqn.RelationFQN{}
 	for _, kv := range resp.Kvs {
 		if string(kv.Value) != seqName {
 			continue
 		}
 
 		s := strings.Split(string(kv.Key), "/")
-		colName := s[len(s)-1]
 		relName := s[len(s)-2]
-		cols = append(cols, fmt.Sprintf("%s.%s", relName, colName))
+		rels = append(rels, &rfqn.RelationFQN{RelationName: relName})
 	}
 
-	return cols, nil
+	return rels, nil
 }
 
 func (q *EtcdQDB) CreateSequence(ctx context.Context, seqName string, initialValue int64) error {
@@ -2238,16 +2238,9 @@ func (q *EtcdQDB) DropSequence(ctx context.Context, seqName string, force bool) 
 		Str("sequence", seqName).
 		Bool("force", force).
 		Msg("etcdqdb: drop sequence")
-	depends, err := q.getSequenceColumns(ctx, seqName)
-	if err != nil {
-		return err
-	}
-	if len(depends) != 0 && !force {
-		return spqrerror.Newf(spqrerror.SPQR_SEQUENCE_ERROR, "column %q is attached to sequence", depends[0])
-	}
 
 	key := sequenceNodePath(seqName)
-	_, err = q.cli.Delete(ctx, key)
+	_, err := q.cli.Delete(ctx, key)
 	return err
 }
 
@@ -2343,4 +2336,62 @@ func (q *EtcdQDB) CurrVal(ctx context.Context, seqName string) (int64, error) {
 	}
 
 	return nextval, err
+}
+
+func packEtcdCommands(operations []QdbStatement) ([]clientv3.Op, error) {
+	etcdOperations := make([]clientv3.Op, len(operations))
+	for index, v := range operations {
+		switch v.CmdType {
+		case CMD_PUT:
+			etcdOperations[index] = clientv3.OpPut(v.Key, v.Value)
+		case CMD_DELETE:
+			etcdOperations[index] = clientv3.OpDelete(v.Key)
+		default:
+			return nil, fmt.Errorf("not found operation type: %d", v.CmdType)
+		}
+	}
+	return etcdOperations, nil
+}
+
+func (q *EtcdQDB) ExecNoTransaction(ctx context.Context, operations []QdbStatement) error {
+	etcdOperations, err := packEtcdCommands(operations)
+	if err != nil {
+		return err
+	}
+	_, err = q.cli.Txn(ctx).Then(etcdOperations...).Commit()
+	return err
+}
+
+func (q *EtcdQDB) CommitTransaction(ctx context.Context, transaction *QdbTransaction) error {
+	if transaction == nil {
+		return fmt.Errorf("cant't commit empty transaction")
+	}
+	if err := transaction.Validate(); err != nil {
+		return fmt.Errorf("invalid transaction %s: %w", transaction.Id(), err)
+	}
+	etcdOperations, err := packEtcdCommands(transaction.commands)
+	if err != nil {
+		return err
+	}
+	etcdOperations = append(etcdOperations, clientv3.OpDelete(transactionRequest))
+	resp, err := q.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(transactionRequest), "=", transaction.transactionId.String())).
+		Then(etcdOperations...).
+		Commit()
+
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %s", transaction.Id())
+	}
+	if !resp.Succeeded {
+		return fmt.Errorf("transaction '%s' cann't be committed", transaction.Id())
+	}
+	return nil
+}
+
+func (q *EtcdQDB) BeginTransaction(ctx context.Context, transaction *QdbTransaction) error {
+	if transaction == nil {
+		return fmt.Errorf("cant't begin empty transaction")
+	}
+	_, err := q.cli.Put(ctx, transactionRequest, transaction.transactionId.String())
+	return err
 }
