@@ -1,23 +1,37 @@
 package plan
 
 import (
+	"fmt"
+	"maps"
+
 	"github.com/pg-sharding/lyx/lyx"
 	"github.com/pg-sharding/spqr/pkg/models/kr"
 	"github.com/pg-sharding/spqr/pkg/spqrlog"
 	"github.com/pg-sharding/spqr/pkg/tsa"
 	"github.com/pg-sharding/spqr/pkg/tupleslot"
+	"github.com/pg-sharding/spqr/router/server"
 )
 
 type Plan interface {
 	Stmt() lyx.Node
 	SetStmt(lyx.Node)
+
 	ExecutionTargets() []kr.ShardKey
-	GetQuery(sh string) string
+	GetGangMemberMsg(sh kr.ShardKey) string
+
+	/* get SubPlan if any */
+
+	RunSlice(server.Server) error
+
+	Subplan() Plan
 }
 
 type ScatterPlan struct {
 	Plan
 	SubPlan Plan
+
+	/* explicitly set-up link to next slice */
+	SubSlice Plan
 
 	stmt lyx.Node
 
@@ -25,7 +39,9 @@ type ScatterPlan struct {
 	IsDDL  bool
 	Forced bool
 
-	OverwriteQuery string
+	RunF func(server.Server) error
+
+	OverwriteQuery map[string]string
 	/* Empty means execute everywhere */
 	ExecTargets []kr.ShardKey
 }
@@ -42,8 +58,22 @@ func (sp *ScatterPlan) SetStmt(n lyx.Node) {
 	sp.stmt = n
 }
 
-func (s *ScatterPlan) GetQuery(string) string {
-	return s.OverwriteQuery
+func (s *ScatterPlan) GetGangMemberMsg(sh kr.ShardKey) string {
+	if msg, ok := s.OverwriteQuery[sh.Name]; ok {
+		return msg
+	}
+	return ""
+}
+
+func (s *ScatterPlan) Subplan() Plan {
+	return s.SubSlice
+}
+
+func (s *ScatterPlan) RunSlice(serv server.Server) error {
+	if s.RunF == nil {
+		return fmt.Errorf("execution failed, run function missing")
+	}
+	return s.RunF(serv)
 }
 
 var _ Plan = &ScatterPlan{}
@@ -66,14 +96,27 @@ func (sp *ModifyTable) SetStmt(n lyx.Node) {
 	sp.stmt = n
 }
 
-func (s *ModifyTable) GetQuery(string) string {
+func (s *ModifyTable) GetGangMemberMsg(kr.ShardKey) string {
 	return ""
+}
+
+func (s *ModifyTable) Subplan() Plan {
+	return nil
+}
+
+func (s *ModifyTable) RunSlice(server.Server) error {
+	return fmt.Errorf("unexpected run function call")
 }
 
 var _ Plan = &ModifyTable{}
 
 type ShardDispatchPlan struct {
 	Plan
+
+	/* Subplan */
+
+	SP   Plan
+	runF func(server.Server) error
 
 	PStmt              lyx.Node
 	ExecTarget         kr.ShardKey
@@ -92,8 +135,19 @@ func (sp *ShardDispatchPlan) SetStmt(n lyx.Node) {
 	sp.PStmt = n
 }
 
-func (s *ShardDispatchPlan) GetQuery(string) string {
+func (s *ShardDispatchPlan) GetGangMemberMsg(kr.ShardKey) string {
 	return ""
+}
+
+func (s *ShardDispatchPlan) Subplan() Plan {
+	return s.SP
+}
+
+func (s *ShardDispatchPlan) RunSlice(serv server.Server) error {
+	if s.runF == nil {
+		return fmt.Errorf("execution failed, run function missing")
+	}
+	return s.runF(serv)
 }
 
 var _ Plan = &ShardDispatchPlan{}
@@ -117,8 +171,16 @@ func (sp *RandomDispatchPlan) SetStmt(n lyx.Node) {
 	sp.stmt = n
 }
 
-func (s *RandomDispatchPlan) GetQuery(string) string {
+func (s *RandomDispatchPlan) GetGangMemberMsg(kr.ShardKey) string {
 	return ""
+}
+
+func (s *RandomDispatchPlan) Subplan() Plan {
+	return nil
+}
+
+func (s *RandomDispatchPlan) RunSlice(server.Server) error {
+	return fmt.Errorf("unexpected run function call")
 }
 
 var _ Plan = &RandomDispatchPlan{}
@@ -144,8 +206,16 @@ func (sp *VirtualPlan) SetStmt(n lyx.Node) {
 	sp.stmt = n
 }
 
-func (s *VirtualPlan) GetQuery(string) string {
+func (s *VirtualPlan) GetGangMemberMsg(kr.ShardKey) string {
 	return ""
+}
+
+func (s *VirtualPlan) Subplan() Plan {
+	return nil
+}
+
+func (s *VirtualPlan) RunSlice(server.Server) error {
+	return fmt.Errorf("unexpected run function call")
 }
 
 var _ Plan = &VirtualPlan{}
@@ -170,11 +240,19 @@ func (sp *DataRowFilter) SetStmt(n lyx.Node) {
 	sp.stmt = n
 }
 
-func (s *DataRowFilter) GetQuery(sh string) string {
+func (s *DataRowFilter) GetGangMemberMsg(sh kr.ShardKey) string {
 	if s.SubPlan == nil {
 		return ""
 	}
-	return s.SubPlan.GetQuery(sh)
+	return s.SubPlan.GetGangMemberMsg(sh)
+}
+
+func (s *DataRowFilter) Subplan() Plan {
+	return s.SubPlan.Subplan()
+}
+
+func (s *DataRowFilter) RunSlice(serv server.Server) error {
+	return s.SubPlan.RunSlice(serv)
 }
 
 var _ Plan = &DataRowFilter{}
@@ -198,14 +276,23 @@ func (sp *CopyPlan) SetStmt(n lyx.Node) {
 	sp.stmt = n
 }
 
-func (s *CopyPlan) GetQuery(string) string {
+func (s *CopyPlan) GetGangMemberMsg(kr.ShardKey) string {
 	return ""
+}
+
+func (s *CopyPlan) Subplan() Plan {
+	return nil
+}
+
+func (s *CopyPlan) RunSlice(server.Server) error {
+	return fmt.Errorf("unexpected run function call")
 }
 
 var _ Plan = &CopyPlan{}
 
 const NOSHARD = ""
 
+/* XXX: check subplan here? */
 func mergeExecTargets(l, r []kr.ShardKey) []kr.ShardKey {
 	/* XXX: nil means all */
 	if l == nil {
@@ -270,14 +357,16 @@ func Combine(p1, p2 Plan) Plan {
 	case *VirtualPlan:
 		return p2
 	case *ScatterPlan:
-		rs := p1.GetQuery("")
-		if rs == "" {
-			// XXX: is this bad?
-			rs = p2.GetQuery("")
+		merged := make(map[string]string)
+		maps.Copy(merged, shq1.OverwriteQuery)
+		// XXX: is this bad?
+		switch shq2 := p2.(type) {
+		case *ScatterPlan:
+			maps.Copy(merged, shq2.OverwriteQuery)
 		}
 
 		return &ScatterPlan{
-			OverwriteQuery: rs,
+			OverwriteQuery: merged,
 			ExecTargets:    mergeExecTargets(p1.ExecutionTargets(), p2.ExecutionTargets()),
 		}
 	case *RandomDispatchPlan:
